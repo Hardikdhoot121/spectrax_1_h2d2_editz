@@ -68,9 +68,12 @@ interface WorkoutScreenProps {
   }) => void;
   onAutoDetect?: (key: string) => void;
   bodyType?: BodyType;
+  adaptiveFactor?: number;
+  onSnapshotUpdate?: (liveStats: any) => void;
+  onCancel?: () => void;
 }
 
-type WorkoutPanelId = "focus" | "timer" | "reps" | "engine" | "sense";
+type WorkoutPanelId = "focus" | "timer" | "reps" | "engine" | "sense" | "dial" | "tut";
 
 type PanelPosition = {
   x: number;
@@ -95,6 +98,7 @@ const getDefaultPanelPositions = (): PanelPositions => {
     reps: { x: Math.max(width / 2 - 110, 30), y: Math.max(height - 250, 30) },
     engine: { x: 40, y: Math.max(height - 110, 30) },
     sense: { x: 280, y: Math.max(height - 110, 30) },
+    dial: { x: Math.max(width - 230, 30), y: 150 },
   };
 };
 
@@ -158,10 +162,8 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
   const isMountedRef = useRef<boolean>(true);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const panelRefs = useRef<Record<
-    WorkoutPanelId,
-    React.RefObject<HTMLDivElement>
-  > | null>(null);
+  const isMountedRef = useRef<boolean>(true);
+  const panelRefs = useRef<Record<WorkoutPanelId, React.RefObject<HTMLDivElement>> | null>(null);
 
   if (!panelRefs.current) {
     panelRefs.current = {
@@ -170,11 +172,13 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
       reps: React.createRef<HTMLDivElement>(),
       engine: React.createRef<HTMLDivElement>(),
       sense: React.createRef<HTMLDivElement>(),
+      dial: React.createRef<HTMLDivElement>()
     };
   }
 
   const panelRefsById = panelRefs.current;
   const [panelsLocked, setPanelsLocked] = useState(true);
+  const [currentAngle, setCurrentAngle] = useState(0);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [panelPositions, setPanelPositions] = useState<PanelPositions>(() => getStoredPanelPositions());
   const [showExitModal, setShowExitModal] = useState(false);
@@ -229,31 +233,21 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
   const frameSkipRef = useRef<number>(0); // frame-skip counter
   const workerRef = useRef<Worker | null>(null); // pose worker
   const pendingLandmarksRef = useRef<any>(null); // latest landmarks for worker
-  const lastObservedLandmarksRef = useRef<PoseLandmark[] | null>(null);
-  const previousObservedLandmarksRef = useRef<PoseLandmark[] | null>(null);
+  const lastObservedLandmarksRef = useRef<any[] | null>(null);
+  const previousObservedLandmarksRef = useRef<any[] | null>(null);
   const dropoutFrameCountRef = useRef(0);
   const [mismatchError, setMismatchError] = useState<string | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
-  // Start throttle monitor once when component mounts
-  useEffect(() => {
-    throttleMonitor.start();
-    return () => {
-      // Note: we don't stop it globally because other components may need it
-    };
-  }, []);
-
-  // Get current throttle level and optionally show performance toast
-  const throttleLevel = useThrottleLevel();
-
-  useEffect(() => {
-    if (throttleLevel === 1) {
-      console.warn("[Performance] Reduced visuals due to CPU load");
-      // Optional: show a non-intrusive toast/notification
-    } else if (throttleLevel === 2) {
-      console.warn("[Performance] Minimal visuals – 3D view disabled");
-    }
-  }, [throttleLevel]);
+  const [gestureConfidences, setGestureConfidences] = useState<Record<string, number>>({});
+  const [lastGestureCommand, setLastGestureCommand] = useState<GestureCommand | null>(null);
+  const [gestureHudVisible, setGestureHudVisible] = useState(false);
+  const gestureHudTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const workoutControlRef = useRef<'idle' | 'running' | 'paused'>('idle');
+  const [workoutControlState, setWorkoutControlState] = useState<'idle' | 'running' | 'paused'>('idle');
+  const ghostFramesRef = useRef<FrameData[]>([]);
+  const ghostStatsRef = useRef<GhostStats | null>(null);
+  const [hasGhost, setHasGhost] = useState(false);
 
   const clampPanelPositions = (positions: PanelPositions): PanelPositions => {
     const { width, height } = getViewportSize();
@@ -330,25 +324,17 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
   // for comparison — it doesn't need to cause a re-render on its own.
   const prevRepsRef = useRef(0);
 
-  // ── Announce pose correction feedback ─────────────────────────────────────────
-  // useEffect runs ONLY when engineState.feedback changes to a different string.
-  // React's dependency comparison handles deduplication automatically — the same
-  // message repeated across frames will NOT re-trigger this effect.
+  // ── Unified Virtual Trainer Voice Coaching System ──────────────────────────────
   useEffect(() => {
+    // 1. Maintain ARIA accessibility announcements first
     setFeedbackAnnouncement(engineState.feedback);
-  }, [engineState.feedback]);
-
-  // ── Announce rep count on each increment ─────────────────────────────────────
-  // We check prevRepsRef so we only announce when reps actually go up.
-  // This prevents announcing "Rep 0" on first render.
-  useEffect(() => {
-    if (engineState.reps > 0 && engineState.reps > prevRepsRef.current) {
-      // Announce the number for screen readers
+    
+    const repCompleted = engineState.reps > prevRepsRef.current && engineState.reps > 0;
+    if (repCompleted) {
       setRepAnnouncement(engineState.reps.toString());
 
       // Voice Coach feature: Physically speak the rep count out loud
       if ('speechSynthesis' in window) {
-        // Cancel any ongoing speech to prioritize the current rep count
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(engineState.reps.toString());
         // Optional: you can tune rate and pitch here
@@ -356,8 +342,22 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
         window.speechSynthesis.speak(utterance);
       }
     }
-    prevRepsRef.current = engineState.reps;
-  }, [engineState.reps]);
+
+    // Execute speech
+    if (shouldSpeak && speechCandidate) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(speechCandidate);
+      utterance.rate = 1.05; // Slightly faster for responsiveness
+      window.speechSynthesis.speak(utterance);
+
+      lastSpokenFeedbackRef.current = speechCandidate; // Store actual spoken candidate
+      lastSpokenTimeRef.current = now;
+
+      if (isMotivationalPhraseUsed) {
+        lastMotivationTimeRef.current = now;
+      }
+    }
+  }, [engineState.feedback, engineState.reps, engineState.stage, voiceFeedbackEnabled, mismatchError]);
 
   // ── Announce exercise mismatch errors ─────────────────────────────────────────
   // role="alert" with aria-live="assertive" will interrupt the screen reader
@@ -370,13 +370,20 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
 
 
   const workerAnglesRef = useRef<Record<string, number>>({});
-  const wsSocketRef = useRef<WebSocket | null>(null);
   const offscreenEnabledRef = useRef<boolean>(false);
+  const { initOffscreenCanvas } = useOffscreenCanvas();
+  useWorkoutWebSocket();
+
 
   const handlePoseResults = useCallback(async (results: any) => {
     // ── SINGLE USER LOCK: Filter out erratic detections or second people ──
     const filteredResults = poseLockService.filter(results);
     if (!filteredResults || !filteredResults.poseLandmarks) return;
+
+    // Calculate primary joint angle on every frame for real-time dial updates
+    const currentFrameAngles = getJointAngles(results.poseLandmarks);
+    const primaryJoint = exercise.primaryJoint || 'knee';
+    setCurrentAngle(currentFrameAngles[primaryJoint] || 0);
 
     // ── GESTURE COMMAND PARSING ─────────────────────────────────────────────
     const gestureResult = gestureService.analyze(results.poseLandmarks);
@@ -449,7 +456,9 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
               ? "jumpingJack"
               : label.includes("bicep curl")
                 ? "bicepCurl"
-                : "";
+                : label.includes("chest press")
+                  ? "chestPressPunches"
+                  : "";
 
       if (
         detectedKey &&
@@ -561,6 +570,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
   useEffect(() => {
     isMountedRef.current = true;
     startTimeRef.current = Date.now();
+    exerciseEngine.reset();
 
     // Load Ghost Data
     const ghostData = ghostService.loadGhost(exercise.key);
@@ -578,41 +588,12 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
     const worker = createPoseWorker();
     workerRef.current = worker;
 
-    // Worker posts back computed angles — exercise detection stays on main thread
-    worker.onmessage = (evt: MessageEvent) => {
-      const { angles } = evt.data;
-      workerAnglesRef.current = angles;
-    };
-
-    // ── WebSocket connection to backend (optional, non-blocking) ─────────────
-    let wsSocket: WebSocket | null = null;
-    try {
-      const rawBackendUrl = import.meta.env.VITE_BACKEND_URL;
-      if (!rawBackendUrl) {
-        console.warn(
-          "[SpectraX] VITE_BACKEND_URL is not set. " +
-          "Falling back to http://localhost:3001. " +
-          "Set VITE_BACKEND_URL in .env.local for non-local deployments " +
-          "(see .env.example for the expected format).",
-        );
+    worker.onmessage = (event: MessageEvent) => {
+      const { angles } = event.data;
+      if (angles) {
+        workerAnglesRef.current = angles;
       }
-      const backendUrl = (rawBackendUrl ?? "http://localhost:3001").replace(/\/+$/, "");
-      const wsUrl = backendUrl.replace(/^http/, "ws") + "/socket.io/?EIO=4&transport=websocket";
-      wsSocket = new WebSocket(wsUrl);
-      wsSocketRef.current = wsSocket;
-      wsSocket.onopen = () => console.log("[SpectraX WS] connected to backend at", backendUrl);
-      wsSocket.onerror = () => {
-        console.warn(
-          "[SpectraX WS] Could not connect to backend at",
-          wsUrl,
-          "— live backend features will be unavailable. " +
-          "Check that the server is running and that VITE_BACKEND_URL is correct in .env.local.",
-        );
-        wsSocketRef.current = null;
-      };
-    } catch (_) {
-      wsSocketRef.current = null;
-    }
+    };
 
 
 
@@ -621,30 +602,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
 
       try {
         const canvasEl = canvasRef.current as any;
-        if (canvasEl.__offscreenTransferred) {
-          offscreenEnabledRef.current = true;
-          console.log("[WorkoutScreen] Canvas already has Offscreen control transferred.");
-        } else {
-          const isOffscreenSupported = !!canvasEl.transferControlToOffscreen;
-          offscreenEnabledRef.current = false;
-
-          if (isOffscreenSupported) {
-            try {
-              const offscreen = canvasEl.transferControlToOffscreen();
-              worker.postMessage({ type: "initCanvas", canvas: offscreen }, [
-                offscreen,
-              ]);
-              offscreenEnabledRef.current = true;
-              canvasEl.__offscreenTransferred = true;
-              console.log("[WorkoutScreen] OffscreenCanvas enabled.");
-            } catch (e) {
-              console.warn(
-                "[WorkoutScreen] Failed to transfer canvas control:",
-                e,
-              );
-            }
-          }
-        }
+        initOffscreenCanvas(canvasEl, worker);
 
         const ctx = !offscreenEnabledRef.current
           ? canvasRef.current.getContext("2d")
@@ -676,42 +634,29 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
       isMountedRef.current = false;
       stopSystem();
       worker.terminate();
-      if (wsSocketRef.current) {
-        try {
-          wsSocketRef.current.close();
-        } catch (err) {
-          console.warn("WS close failed:", err);
-        }
-      }
       clearInterval(timerRef);
       gestureService.reset();
+      exerciseEngine.reset();
       if (gestureHudTimerRef.current) clearTimeout(gestureHudTimerRef.current);
     };
   }, [exercise, startSystem, stopSystem]);
 
   useEffect(() => {
-    setPanelPositions((currentPositions) =>
-      clampPanelPositions(currentPositions),
-    );
+    setPanelPositions((currentPositions) => clampPanelPositions(currentPositions));
 
     const handleResize = () => {
-      setPanelPositions((currentPositions) =>
-        clampPanelPositions(currentPositions),
-      );
+      setPanelPositions((currentPositions) => clampPanelPositions(currentPositions));
     };
 
-    window.addEventListener("resize", handleResize);
+    window.addEventListener('resize', handleResize);
 
     return () => {
-      window.removeEventListener("resize", handleResize);
+      window.removeEventListener('resize', handleResize);
     };
   }, [clampPanelPositions]);
 
   useEffect(() => {
-    window.localStorage.setItem(
-      PANEL_POSITION_STORAGE_KEY,
-      JSON.stringify(panelPositions),
-    );
+    window.localStorage.setItem(PANEL_POSITION_STORAGE_KEY, JSON.stringify(panelPositions));
   }, [panelPositions]);
 
   const handleEnd = () => {
@@ -752,6 +697,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
       mistakes: finalMistakes,
       bestStreak: mutableState.current.bestStreak,
       jumpingJackSync: mutableState.current.jumpingJackSync,
+      tutMetrics: mutableState.current.tutMetrics,
       tags: clipEngine.generateSessionTags({
         accuracy: accuracy,
         avgConfidence: clipResult?.confidence || 0.8,
@@ -781,27 +727,25 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
       ...currentPositions,
       [panelId]: {
         x: data.x,
-        y: data.y,
-      },
+        y: data.y
+      }
     }));
   };
 
   const handlePanelStop = (panelId: WorkoutPanelId, data: DraggableData) => {
-    setPanelPositions((currentPositions) =>
-      clampPanelPositions({
-        ...currentPositions,
-        [panelId]: {
-          x: data.x,
-          y: data.y,
-        },
-      }),
-    );
+    setPanelPositions((currentPositions) => clampPanelPositions({
+      ...currentPositions,
+      [panelId]: {
+        x: data.x,
+        y: data.y
+      }
+    }));
   };
 
   const renderDraggablePanel = (
     panelId: WorkoutPanelId,
     className: string,
-    content: React.ReactNode,
+    content: React.ReactNode
   ) => (
     <Draggable
       nodeRef={panelRefsById[panelId]}
@@ -813,7 +757,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
     >
       <div
         ref={panelRefsById[panelId]}
-        className={`workout-draggable-panel ${className} ${panelsLocked ? "is-locked" : "is-unlocked"}`}
+        className={`workout-draggable-panel ${className} ${panelsLocked ? 'is-locked' : 'is-unlocked'}`}
       >
         {content}
       </div>
@@ -834,6 +778,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
           </p>
         </div>
       )}
+      <CameraErrorBoundary>
       {/* Background Video Layer */}
       <div
         className="camera-viewport"
@@ -933,34 +878,6 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
         </div>
       )}
 
-      {/* Performance Mode Indicator (throttle level ≥ 1) */}
-      {throttleLevel >= 1 && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: "100px",
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: "rgba(0,0,0,0.75)",
-            backdropFilter: "blur(8px)",
-            padding: "8px 20px",
-            borderRadius: "40px",
-            zIndex: 100,
-            border: `1px solid ${throttleLevel === 1 ? "var(--neon-yellow)" : "var(--neon-red)"}`,
-            color:
-              throttleLevel === 1 ? "var(--neon-yellow)" : "var(--neon-red)",
-            fontSize: "0.7rem",
-            fontWeight: 700,
-            letterSpacing: "1px",
-            pointerEvents: "none",
-          }}
-        >
-          {throttleLevel === 1
-            ? "⚡ PERFORMANCE MODE: REDUCED VISUALS"
-            : "⚠️ PERFORMANCE MODE: 3D VIEW OFF"}
-        </div>
-      )}
-
       {/* Top Header Controls */}
       <div
         style={{
@@ -968,11 +885,33 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
           zIndex: 10,
           display: "flex",
           justifyContent: "space-between",
+          alignItems: "flex-start",
           padding: "30px",
           pointerEvents: "none",
         }}
       >
-        <div className="glass animate-in" style={{ padding: "16px 24px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px", pointerEvents: "auto" }}>
+          <button
+            onClick={() => onCancel && onCancel()}
+            className="btn-neon"
+            aria-label="Exit Workout"
+            style={{
+              padding: "8px 16px",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              fontSize: "0.85rem",
+              background: "rgba(0, 240, 255, 0.1)",
+              border: "1px solid rgba(0, 240, 255, 0.3)",
+              color: "var(--neon-cyan)",
+              width: "fit-content",
+            }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+            EXIT
+          </button>
+          
+          <div className="glass animate-in" style={{ padding: "16px 24px", pointerEvents: "none" }}>
           <div
             style={{
               fontSize: "0.65rem",
@@ -1009,6 +948,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
               </span>
             )}
           </div>
+        </div>
         </div>
 
         <div
@@ -1049,11 +989,19 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
       <div className="workout-layout-controls" style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
         <button
           type="button"
-          className={`workout-lock-toggle ${panelsLocked ? "is-locked" : "is-unlocked"}`}
+          className={`workout-lock-toggle ${panelsLocked ? 'is-locked' : 'is-unlocked'}`}
           onClick={() => setPanelsLocked((isLocked) => !isLocked)}
         >
           {panelsLocked ? <Lock size={16} /> : <Unlock size={16} />}
-          {panelsLocked ? "Unlock Layout" : "Lock Layout"}
+          {panelsLocked ? 'Unlock Layout' : 'Lock Layout'}
+        </button>
+        <button
+          type="button"
+          className={`workout-lock-toggle ${voiceFeedbackEnabled ? 'is-locked' : 'is-unlocked'}`}
+          onClick={() => updateSetting('voiceFeedback', !voiceFeedbackEnabled)}
+        >
+          {voiceFeedbackEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+          {voiceFeedbackEnabled ? 'Voice Coach: ON' : 'Voice Coach: OFF'}
         </button>
         <button
           type="button"
@@ -1079,27 +1027,13 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
       </div>
 
       <div className="workout-panel-layer">
-        {renderDraggablePanel(
-          "focus",
-          "",
-          <FocusPanel exerciseName={exercise.name} />,
-        )}
-        {renderDraggablePanel("timer", "", <TimerPanel seconds={seconds} />)}
-        {renderDraggablePanel(
-          "reps",
-          "",
-          <RepsPanel reps={engineState.reps} statusColor={statusColor} />,
-        )}
-        {renderDraggablePanel(
-          "engine",
-          "",
-          <EnginePanel status={engineState.status} statusColor={statusColor} />,
-        )}
-        {renderDraggablePanel(
-          "sense",
-          "",
-          <SensePanel clipEngine={clipEngine} clipResult={clipResult} />,
-        )}
+        {renderDraggablePanel('focus', '', <FocusPanel exerciseName={exercise.name} />)}
+        {renderDraggablePanel('timer', '', <TimerPanel seconds={seconds} />)}
+        {renderDraggablePanel('reps', '', <RepsPanel reps={engineState.reps} statusColor={statusColor} />)}
+        {renderDraggablePanel('engine', '', <EnginePanel status={engineState.status} statusColor={statusColor} />)}
+        {renderDraggablePanel('sense', '', <SensePanel clipEngine={clipEngine} clipResult={clipResult} />)}
+        {renderDraggablePanel('dial', '', <AngleDialPanel angle={currentAngle} label={exercise.primaryJoint} statusColor={statusColor} />)}
+        {renderDraggablePanel('tut', '', <TutPanel tutMetrics={engineState.tutMetrics} statusColor={statusColor} />)}
       </div>
 
       {/* MID-SET MISMATCH ALERT */}
@@ -1223,12 +1157,14 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
             </span>
           </div>
           <p
+            className="pb-4"
             style={{
               fontFamily: "var(--font-heading)",
               fontSize: "1.8rem",
               color: "#fff",
               letterSpacing: "2px",
               margin: "10px 0",
+              paddingBottom: "16px",
             }}
             aria-live="assertive"
             aria-atomic="true"
@@ -1727,6 +1663,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
           </div>
         </div>
       )}
+      </CameraErrorBoundary>
     </div>
   );
 };
