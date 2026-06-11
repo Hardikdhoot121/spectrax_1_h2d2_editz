@@ -214,6 +214,7 @@ export interface EngineState {
   jumpingJackSync?: JumpingJackSyncMetrics;
 
   wristSupinationScore?: number;
+  holdTime?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,15 +230,6 @@ interface RepParams {
   streakMinScore: number;
 }
 
-const ENGINE_DEFAULTS: RepParams = {
-  repCooldown: 600,
-  hysteresis: 10,
-  smoothingWindow: 5,
-  minDownDuration: 150,
-  correctRepMinScore: 70,
-  streakMinScore: 85,
-};
-
 const layoutOverrides = new Map<string, Partial<RepParams>>();
 
 // ─────────────────────────────────────────────
@@ -252,8 +244,6 @@ const ENGINE_DEFAULTS: RepParams = {
   correctRepMinScore: 70,
   streakMinScore: 80,
 };
-
-const layoutOverrides = new Map<string, Partial<RepParams>>();
 
 export class ExerciseEngine {
   private readonly BASE_REP_COOLDOWN = 600;
@@ -295,7 +285,7 @@ export class ExerciseEngine {
     landmarks?: any[]
   ): Promise<EngineState> {
     const now = Date.now();
-    const p = this.repParams(config.key);
+    const p = ENGINE_DEFAULTS;
 
     // ───────── KINEMATICS ENGINE ─────────
     let updatedVbtMetrics = currentState.vbtMetrics;

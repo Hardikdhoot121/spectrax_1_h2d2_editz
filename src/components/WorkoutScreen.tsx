@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import Draggable, {
   type DraggableData,
   type DraggableEvent,
@@ -11,10 +11,12 @@ import {
   Lock,
   Unlock,
 } from "lucide-react";
+import { useCameraPose } from "../hooks/useCameraPose";
 import { cameraService } from "../services/cameraService";
 import { poseService } from "../services/poseService";
 import { overlayRenderer } from "../services/overlayRenderer";
 import { getJointAngles, getJointVisibility } from "../services/angleUtils";
+import { getPostureErrorCategories } from "../engine/feedbackEngine";
 import { exerciseEngine, EngineState } from "../services/exerciseEngine";
 import { ExerciseConfig } from "../config/exercises";
 import { sessionRecorder } from "../services/sessionRecorder";
@@ -22,7 +24,9 @@ import { skeletalSense } from "../services/skeletalSense"; // Kept on main threa
 import { poseLockService } from "../services/poseLockService";
 import { clipEngine } from "../services/clipEngine";
 import { BodyType } from "../services/bodyTypeEngine";
+import { initialSquatDepthStats } from "../services/Squat_depth_classifier";
 import { useWorkoutSync } from "../hooks/useWorkoutSync";
+import { useDisplayConfig } from "../hooks/useDisplayConfig";
 import {
   FocusPanel,
   TimerPanel,
@@ -30,33 +34,16 @@ import {
   EnginePanel,
   SensePanel,
 } from "./WorkoutPanels";
+import { ghostService } from "../services/ghostService";
+import type { FrameData } from "../services/sessionRecorder";
+import { FpsMonitor } from "./FpsMonitor";
+import { gestureService, GestureCommand } from "../services/gestureService";
 import {
   useThrottleLevel,
   throttleMonitor,
 } from "../services/performanceThrottleService";
 import { Replay3DModel } from "./Replay3DModel";
-import React, { useState, useEffect, useRef, useCallback } from "react";
-import Draggable, { type DraggableData, type DraggableEvent } from 'react-draggable';
-import { StopCircle, ArrowUpCircle, ArrowDownCircle, Lock, Unlock, Activity } from 'lucide-react';
-import { useCameraPose } from '../hooks/useCameraPose';
-import { overlayRenderer } from '../services/overlayRenderer';
-import { getJointAngles, getJointVisibility } from '../services/angleUtils';
-import { getPostureErrorCategories } from '../engine/feedbackEngine';
-import { exerciseEngine, EngineState } from '../services/exerciseEngine';
-import { ExerciseConfig } from '../config/exercises';
-import { sessionRecorder } from '../services/sessionRecorder';
-import { skeletalSense } from '../services/skeletalSense'; // Kept on main thread for reliable auto-detect
-import { poseLockService } from '../services/poseLockService';
-import { clipEngine } from '../services/clipEngine';
-import { BodyType } from '../services/bodyTypeEngine';
-import { initialSquatDepthStats } from '../services/Squat_depth_classifier';
-import { useWorkoutSync } from '../hooks/useWorkoutSync';
-import { useDisplayConfig } from '../hooks/useDisplayConfig';
-import { FocusPanel, TimerPanel, RepsPanel, EnginePanel, SensePanel } from './WorkoutPanels';
-import { ghostService } from '../services/ghostService';
-import type { FrameData } from '../services/sessionRecorder';
-import { FpsMonitor } from './FpsMonitor';
-import { gestureService, GestureCommand } from '../services/gestureService';
+import { div } from "three/examples/jsm/nodes/Nodes.js";
 
 // ── Web Worker (Vite native worker bundling) ──────────────────────────────────
 const createPoseWorker = () =>
@@ -131,13 +118,33 @@ const getStoredPanelPositions = (): PanelPositions => {
         y: typeof storedPosition?.y === "number" ? storedPosition.y : defaults[panelId].y,
       };
 
-        return positions;
-      },
+      return positions;
+    },
       {} as PanelPositions,
     );
   } catch {
     return defaults;
   }
+};
+
+// ── Visually-hidden style (sr-only) ─────────────────────────────────────────
+const srOnly: React.CSSProperties = {
+  position: "absolute",
+  width: "1px",
+  height: "1px",
+  padding: 0,
+  margin: "-1px",
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: "0",
+};
+
+type PoseLandmark = {
+  x: number;
+  y: number;
+  z: number;
+  visibility: number;
 };
 
 export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
@@ -146,6 +153,9 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
   onAutoDetect,
   bodyType,
 }) => {
+  const bodyTypeRef = useRef(bodyType);
+  const onAutoDetectRef = useRef(onAutoDetect);
+  const isMountedRef = useRef<boolean>(true);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const panelRefs = useRef<Record<
@@ -173,10 +183,6 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
   const [vlmProgress, setVlmProgress] = useState(0);
   const [clipResult, setClipResult] = useState<any>(null);
   const { isOnline } = useWorkoutSync();
-  const [panelsLocked, setPanelsLocked] = useState(true);
-  const [panelPositions, setPanelPositions] = useState<PanelPositions>(() =>
-    getStoredPanelPositions(),
-  );
 
   const [gestureConfidences, setGestureConfidences] = useState<Record<string, number>>({});
   const [lastGestureCommand, setLastGestureCommand] = useState<string | null>(null);
@@ -249,7 +255,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
     }
   }, [throttleLevel]);
 
-  const clampPanelPositions = (positions: PanelPositions) => {
+  const clampPanelPositions = (positions: PanelPositions): PanelPositions => {
     const { width, height } = getViewportSize();
 
     return (Object.keys(positions) as WorkoutPanelId[]).reduce(
@@ -258,11 +264,17 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
         const maxX = Math.max(width - (panel?.offsetWidth || 0), 0);
         const maxY = Math.max(height - (panel?.offsetHeight || 0), 0);
 
-      return nextPositions;
-    },
+        return {
+          ...nextPositions,
+          [panelId]: {
+            x: Math.min(Math.max(positions[panelId].x, 0), maxX),
+            y: Math.min(Math.max(positions[panelId].y, 0), maxY),
+          },
+        };
+      },
       {} as PanelPositions,
     );
-  }, [panelRefsById]);
+  };
 
 
   useEffect(() => {
@@ -1157,7 +1169,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
                   timestamp: Date.now(),
                   landmarks: pendingLandmarksRef.current,
                   feedback: "READY 🟢",
-                  exercise:"exercise",
+                  exercise: "exercise",
                 },
               ]}
             />
@@ -1579,14 +1591,7 @@ export const WorkoutScreen: React.FC<WorkoutScreenProps> = ({
           </button>
         </div>
       </div>
-      <div className="workout-finish-action">
-        <button
-          onClick={handleEnd}
-          className="btn-neon"
-          style={{ background: "var(--neon-red)", color: "#fff" }}
-        >
-          FINISH SESSION <StopCircle size={18} />
-        </button>
+
 
       {/*
         ══════════════════════════════════════════════════════════
